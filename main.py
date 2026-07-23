@@ -61,7 +61,9 @@ def base64_decoded_variants(text: str):
 
 
 SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||[;|\n]")
-REDIRECT_RE = re.compile(r"(>>?|<)\s*([^\s;|&()<>\"'`]+)")
+WRITE_REDIRECT_RE = re.compile(r">>?\s*([^\s;|&()<>\"'`]+)")
+TEE_RE = re.compile(r"\btee\b((?:\s+-?\w+)*)\s+([^\s;|&()<>\"'`]+)")
+DD_OF_RE = re.compile(r"\bof=([^\s;|&()<>\"'`]+)")
 
 
 def resolves_inside(path: str, root: str, cwd: str) -> bool:
@@ -102,8 +104,14 @@ def bash_command_violates_policy(command: str):
                 if resolved == SECRET_FILE or resolved in EXTRA_SENSITIVE:
                     return True, "Command attempts to read a protected secret/credential file."
 
-            # Check redirection targets (>, >>) for writes escaping the outbox.
-            for _, target in REDIRECT_RE.findall(segment):
+            # Collect every write-target this segment could produce: `>`/`>>`
+            # redirection, `tee <file>`, and `dd of=<file>` — never `<` (that's a read).
+            write_targets = (
+                WRITE_REDIRECT_RE.findall(segment)
+                + [m[1] for m in TEE_RE.findall(segment)]
+                + DD_OF_RE.findall(segment)
+            )
+            for target in write_targets:
                 if not resolves_inside(target, WRITE_ROOT, cwd):
                     return True, "Command attempts to write outside the allowed outbox directory."
 
