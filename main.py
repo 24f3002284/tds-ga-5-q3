@@ -60,25 +60,54 @@ def base64_decoded_variants(text: str):
     return variants
 
 
-def command_reads_forbidden_file(command: str) -> bool:
-    texts = [command] + base64_decoded_variants(command)
-    for text in texts:
-        for token in candidate_tokens(text):
-            if not (token.startswith("/") or token.startswith("~") or "$HOME" in token or ".." in token or token.endswith(".secrets")):
-                continue
-            resolved = expand_token(token)
-            if resolved == SECRET_FILE or resolved in EXTRA_SENSITIVE:
-                return True
-    return False
+SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||[;|\n]")
+REDIRECT_RE = re.compile(r"(>>?|<)\s*([^\s;|&()<>\"'`]+)")
 
 
-def resolves_inside(path: str, root: str) -> bool:
+def resolves_inside(path: str, root: str, cwd: str) -> bool:
     if os.path.isabs(path):
         full = os.path.normpath(path)
     else:
-        full = os.path.normpath(os.path.join(root, path))
+        full = os.path.normpath(os.path.join(cwd, path))
     root = os.path.normpath(root)
     return full == root or full.startswith(root + os.sep)
+
+
+def bash_command_violates_policy(command: str):
+    """Returns (violates: bool, reason: str) checking BOTH forbidden reads
+    and redirection-based writes that escape the allowed outbox, tracking
+    any `cd` changes so relative paths resolve against the *actual* cwd
+    at the point they're used, not just the initial workspace."""
+    texts = [command] + base64_decoded_variants(command)
+    for text in texts:
+        cwd = WORKDIR
+        for segment in SEGMENT_SPLIT_RE.split(text):
+            segment = segment.strip()
+            if not segment:
+                continue
+            tokens = candidate_tokens(segment)
+            if not tokens:
+                continue
+
+            # Track `cd <dir>` so later relative paths resolve correctly.
+            if tokens[0] == "cd" and len(tokens) > 1:
+                cwd = expand_token(tokens[1], cwd)
+                continue
+
+            # Check every non-flag token as a potential forbidden read.
+            for token in tokens:
+                if token.startswith("-") or token in ("cd",):
+                    continue
+                resolved = expand_token(token, cwd)
+                if resolved == SECRET_FILE or resolved in EXTRA_SENSITIVE:
+                    return True, "Command attempts to read a protected secret/credential file."
+
+            # Check redirection targets (>, >>) for writes escaping the outbox.
+            for _, target in REDIRECT_RE.findall(segment):
+                if not resolves_inside(target, WRITE_ROOT, cwd):
+                    return True, "Command attempts to write outside the allowed outbox directory."
+
+    return False, ""
 
 
 def extract_host(url: str) -> str:
@@ -97,16 +126,14 @@ async def check(req: Request):
 
         if tool == "bash":
             command = body["command"]
-            if command_reads_forbidden_file(command):
-                return {
-                    "decision": "block",
-                    "reason": "Command attempts to read a protected secret/credential file.",
-                }
-            return {"decision": "allow", "reason": "No access to protected files detected."}
+            violates, reason = bash_command_violates_policy(command)
+            if violates:
+                return {"decision": "block", "reason": reason}
+            return {"decision": "allow", "reason": "No policy violation detected."}
 
         elif tool == "write_file":
             path = body["path"]
-            if resolves_inside(path, WRITE_ROOT):
+            if resolves_inside(path, WRITE_ROOT, WRITE_ROOT):
                 return {"decision": "allow", "reason": "Write path resolves inside the allowed outbox directory."}
             return {
                 "decision": "block",
